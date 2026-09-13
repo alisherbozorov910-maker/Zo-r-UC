@@ -1,41 +1,111 @@
-const jwt = require('jsonwebtoken');
+const express = require('express');
+const bcrypt = require('bcryptjs');
 const db = require('../config/db');
+const { signUserToken, requireAuth } = require('../middleware/auth');
+const { sendVerificationEmail } = require('../utils/mailer');
 
-const SECRET = process.env.JWT_SECRET || 'dev_secret_please_change';
+const router = express.Router();
 
-function requireAuth(req, res, next) {
-  const token = req.cookies && req.cookies.token;
-  if (!token) return res.status(401).json({ error: 'Tizimga kirilmagan' });
+function generateCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+router.post('/register', async (req, res) => {
   try {
-    const payload = jwt.verify(token, SECRET);
-    const user = db.prepare('SELECT id, full_name, email, is_verified, balance FROM users WHERE id = ?').get(payload.id);
-    if (!user) return res.status(401).json({ error: 'Foydalanuvchi topilmadi' });
-    req.user = user;
-    next();
-  } catch (e) {
-    return res.status(401).json({ error: 'Token yaroqsiz yoki muddati tugagan' });
-  }
-}
+    const { full_name, email, password } = req.body;
+    if (!full_name || !email || !password) {
+      return res.status(400).json({ error: 'Barcha maydonlarni to\'ldiring' });
+    }
+    if (!EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: 'Email manzil noto\'g\'ri' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Parol kamida 6 ta belgidan iborat bo\'lishi kerak' });
+    }
 
-function requireAdmin(req, res, next) {
-  const token = req.cookies && req.cookies.admin_token;
-  if (!token) return res.status(401).json({ error: 'Admin sifatida kirilmagan' });
+    const existing = db.prepare('SELECT id, is_verified FROM users WHERE email = ?').get(email.toLowerCase());
+    if (existing && existing.is_verified) {
+      return res.status(409).json({ error: 'Bu email allaqachon ro\'yxatdan o\'tgan' });
+    }
+
+    const hash = bcrypt.hashSync(password, 10);
+    const code = generateCode();
+    const expires = Date.now() + 15 * 60 * 1000;
+
+    if (existing) {
+      db.prepare('UPDATE users SET full_name = ?, password = ?, verify_code = ?, verify_expires = ? WHERE id = ?')
+        .run(full_name, hash, code, expires, existing.id);
+    } else {
+      db.prepare(
+        'INSERT INTO users (full_name, email, password, is_verified, verify_code, verify_expires, balance, created_at) VALUES (?, ?, ?, 0, ?, ?, 0, ?)'
+      ).run(full_name, email.toLowerCase(), hash, code, expires, Date.now());
+    }
+
+    await sendVerificationEmail(email.toLowerCase(), code);
+    res.json({ success: true, email: email.toLowerCase() });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server xatosi, keyinroq urinib ko\'ring' });
+  }
+});
+
+router.post('/resend-code', async (req, res) => {
   try {
-    const payload = jwt.verify(token, SECRET);
-    if (payload.role !== 'admin') return res.status(403).json({ error: 'Ruxsat yo\'q' });
-    req.admin = true;
-    next();
+    const { email } = req.body;
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get((email || '').toLowerCase());
+    if (!user) return res.status(404).json({ error: 'Foydalanuvchi topilmadi' });
+    if (user.is_verified) return res.status(400).json({ error: 'Email allaqachon tasdiqlangan' });
+
+    const code = generateCode();
+    const expires = Date.now() + 15 * 60 * 1000;
+    db.prepare('UPDATE users SET verify_code = ?, verify_expires = ? WHERE id = ?').run(code, expires, user.id);
+    await sendVerificationEmail(user.email, code);
+    res.json({ success: true });
   } catch (e) {
-    return res.status(401).json({ error: 'Admin token yaroqsiz yoki muddati tugagan' });
+    console.error(e);
+    res.status(500).json({ error: 'Server xatosi' });
   }
-}
+});
 
-function signUserToken(user) {
-  return jwt.sign({ id: user.id }, SECRET, { expiresIn: '30d' });
-}
+router.post('/verify', (req, res) => {
+  const { email, code } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get((email || '').toLowerCase());
+  if (!user) return res.status(404).json({ error: 'Foydalanuvchi topilmadi' });
+  if (user.is_verified) return res.json({ success: true, alreadyVerified: true });
+  if (!user.verify_code || user.verify_code !== code) {
+    return res.status(400).json({ error: 'Kod noto\'g\'ri' });
+  }
+  if (user.verify_expires < Date.now()) {
+    return res.status(400).json({ error: 'Kod muddati tugagan, qaytadan yuboring' });
+  }
+  db.prepare('UPDATE users SET is_verified = 1, verify_code = NULL, verify_expires = NULL WHERE id = ?').run(user.id);
+  res.json({ success: true });
+});
 
-function signAdminToken() {
-  return jwt.sign({ role: 'admin' }, SECRET, { expiresIn: '12h' });
-}
+router.post('/login', (req, res) => {
+  const { email, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get((email || '').toLowerCase());
+  if (!user) return res.status(401).json({ error: 'Email yoki parol noto\'g\'ri' });
+  if (!bcrypt.compareSync(password || '', user.password)) {
+    return res.status(401).json({ error: 'Email yoki parol noto\'g\'ri' });
+  }
+  if (!user.is_verified) {
+    return res.status(403).json({ error: 'Email tasdiqlanmagan', needVerification: true, email: user.email });
+  }
+  const token = signUserToken(user);
+  res.cookie('token', token, { httpOnly: true, sameSite: 'lax', maxAge: 30 * 24 * 60 * 60 * 1000 });
+  res.json({ success: true, user: { id: user.id, full_name: user.full_name, email: user.email, balance: user.balance } });
+});
 
-module.exports = { requireAuth, requireAdmin, signUserToken, signAdminToken, SECRET };
+router.post('/logout', (req, res) => {
+  res.clearCookie('token');
+  res.json({ success: true });
+});
+
+router.get('/me', requireAuth, (req, res) => {
+  res.json({ user: req.user });
+});
+
+module.exports = router;
