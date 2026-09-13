@@ -1,10 +1,13 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
 const db = require('../config/db');
 const { signUserToken, requireAuth } = require('../middleware/auth');
 const { sendVerificationEmail } = require('../utils/mailer');
 
 const router = express.Router();
+const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
 
 function generateCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
@@ -106,6 +109,57 @@ router.post('/logout', (req, res) => {
 
 router.get('/me', requireAuth, (req, res) => {
   res.json({ user: req.user });
+});
+
+// ---------- Google orqali kirish / ro'yxatdan o'tish ----------
+router.post('/google', async (req, res) => {
+  try {
+    if (!googleClient) {
+      return res.status(500).json({ error: 'Google kirish serverda sozlanmagan (GOOGLE_CLIENT_ID yo\'q)' });
+    }
+    const { credential } = req.body;
+    if (!credential) return res.status(400).json({ error: 'Google ma\'lumoti kelmadi' });
+
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID
+    });
+    const payload = ticket.getPayload();
+    if (!payload || !payload.email) {
+      return res.status(400).json({ error: 'Google hisobidan email olinmadi' });
+    }
+    if (!payload.email_verified) {
+      return res.status(400).json({ error: 'Google email manzili tasdiqlanmagan' });
+    }
+
+    const email = payload.email.toLowerCase();
+    const fullName = payload.name || email.split('@')[0];
+
+    let user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+
+    if (!user) {
+      const randomPassword = crypto.randomBytes(24).toString('hex');
+      const hash = bcrypt.hashSync(randomPassword, 10);
+      const info = db.prepare(
+        'INSERT INTO users (full_name, email, password, is_verified, balance, created_at) VALUES (?, ?, ?, 1, 0, ?)'
+      ).run(fullName, email, hash, Date.now());
+      user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
+    } else if (!user.is_verified) {
+      db.prepare('UPDATE users SET is_verified = 1 WHERE id = ?').run(user.id);
+      user = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+    }
+
+    const token = signUserToken(user);
+    res.cookie('token', token, { httpOnly: true, sameSite: 'lax', maxAge: 30 * 24 * 60 * 60 * 1000 });
+    res.json({ success: true, user: { id: user.id, full_name: user.full_name, email: user.email, balance: user.balance } });
+  } catch (e) {
+    console.error('Google login xatosi:', e);
+    res.status(401).json({ error: 'Google orqali kirishda xatolik yuz berdi' });
+  }
+});
+
+router.get('/config', (req, res) => {
+  res.json({ googleClientId: process.env.GOOGLE_CLIENT_ID || null });
 });
 
 module.exports = router;
